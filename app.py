@@ -11,6 +11,9 @@ High-level Overview:
    to the LLM. 
 5. The LLM returns an answer grounded in those chunks.    
 """
+
+import re
+from pathlib import Path
 import streamlit as st
 
 #ManualRAG handles:
@@ -25,23 +28,34 @@ from src.rag_manual import ManualRAG
 # to generate the answer.
 from src.llm_answer import answer_from_chunks
 
+def sanitize_name(name: str) -> str:
+    """Turn a user provided manual name into a safe filename string.
+    Keeps only letters, numbers, underscores, and dashes"""
+    name= name.strip().lower()
+    #Replace any sequence of non alphanumeric characters with a single underscore
+    name= re.sub(r"[^a-z0-9_-]+","_", name)
+    if not name:
+        name="manual"
+    return name
+
 #Title for the Streamlit app UI, can be changed to anything
 st.title("Maintenance Manual Assistant")
 
 """
 Create and cache a single ManualRAG instance for the life of the app.
-
-Streamlit reruns this script on every interaction, so without 
-caching we would recreate the embedding model  each time. 
-@st.cache_resource  ensres we reuse the same ManualRAG object instead.
-
 """
+#Streamlit reruns this script on every interaction, so without 
+#caching we would recreate the embedding model  each time. 
+#@st.cache_resource  ensres we reuse the same ManualRAG object instead.
+
 @st.cache_resource
 def get_rag() -> ManualRAG:
     return ManualRAG()
 
+
 #Shared RAG engine used for all user interactions
 rag = get_rag()
+available_manuals=rag.list_indexes()
 
 #Short descriptor for the applet that appears under the title
 #Like the title this can be changed to whatever fits the use case best
@@ -49,28 +63,71 @@ st.markdown("Upload a maintenance manual PDF and ask questions about it.")
 
 #File uploader widget for the user to provide a PDF.
 #Returns a Streamlit UploadedFile object (file-like)
-uploaded_pdf = st.file_uploader("Upload a maintenance manual (PDF)", type=["pdf"])
+uploaded_pdf = st.file_uploader("Upload a maintenance manual (PDF) or load a previously saved manual", type=["pdf"])
+
+#let the user declare a logical name for the manual being uploaded
+#This name will be used for saving/loading the index on future use
+manual_name_input = st.text_input(
+    "Manual name (used to save/load the index)",
+    placeholder="e.g. forklift_model_x_service_manual"
+)
 
 #----PDF indexing section------
 #When the user has uploaded a PDF and clicks the "Index Manual" button,
 # we read the file, build chunks + embeddings, and store them in the
 # FAISS index. 
 if uploaded_pdf is not None and st.button("Index manual"):
-    try:
+    if not manual_name_input.strip():
+        st.error("Please enter a manual name before indexing.")
+    else:
+        safe_name = sanitize_name(manual_name_input)
+        try:
         #Show spinner icon while processing the pdf
-        with st.spinner("Reading and indexing manual..."):
-            rag.build_index_from_pdf(uploaded_pdf)
-    except ValueError as e:
+            with st.spinner("Reading and indexing manual...This may take longer with scanned PDFs"):
+                rag.build_index_from_pdf(uploaded_pdf)
+            #after building the index save it to disc
+                rag.save_index(safe_name)
+        except ValueError as e:
         #ValueError is used by build_index_from_pdf for known issues,
         #e.g. no extractable text (scanned pdf with no OCR)
         #Will implement OCR in a second version of app
-        st.error(str(e))
-    except Exception as e:
+            st.error(str(e))
+        except Exception as e:
         #Catch all for any unexpected errors during indexing
-        st.error(f"Failed to index manual: {e}")
-    else:
+            st.error(f"Failed to index manual: {e}")
+        else:
         #Only show success if no exception was raised.
-        st.success("Manual indexed! You can now ask questions.")
+            st.success("Manual indexed and saved as '{safe_name}'! You can now ask questions.")
+
+
+st.subheader("Load an existing indexed manual")
+
+available_manuals= rag.list_indexes()
+
+if available_manuals:
+    selected_manual = st.selectbox(
+        "Choose a saved manual to load",
+        options=available_manuals,
+        index=available_manuals.index(rag.current_name) if rag.current_name in available_manuals else 0,
+
+    )
+
+    if st.button("Load Selected Manual"):
+        try:
+            with st.spinner("Loading manual index...."):
+                loaded = rag.load_index(selected_manual)
+            if loaded:
+                st.success(f"Loaded manual: {selected_manual}")
+            else:
+                st.error("Saved index files not found for this manual")
+        except Exception as e:
+            st.error(f"Failed to load manual index: {e}")
+    else:
+        st.info("No saved manual indexes found yet. Index a manual first")
+
+#Show which manual is currently loaded if any loaded from disk
+if rag.index is not None and rag.current_name:
+    st.markdown(f"**Current loaded manual:** '{rag.current_name}'")
 
 #----Question & Answer Section-------
 #Text input where the user types their question about the manual
